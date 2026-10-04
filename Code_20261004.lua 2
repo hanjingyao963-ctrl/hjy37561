@@ -1,0 +1,884 @@
+-- ================= Neon Tracker v3 (Force Hit Edition) =================
+-- 核心：强制伤害反馈 | 穿墙 | 200格锁定 | 密码保护 | 移动端UI
+-- ========================================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============ 密码 ============
+local _key = {57, 49, 57, 56, 55, 56}
+local SECRET = ""
+for _, n in ipairs(_key) do SECRET = SECRET .. string.char(n) end
+
+-- ============ 全局配置 ============
+local Config = {
+    AutoTrack = false,
+    WallBang = true,
+    TrackRadius = 200,
+    AimPart = "Head",
+    ListMode = "Blacklist",
+    PlayerList = {},
+    UIScale = 1,
+}
+_G.TrackerConfig = Config
+
+-- ============ 追踪目标 ============
+local currentTarget = nil
+
+local function isInList(plr)
+    for _, n in ipairs(Config.PlayerList) do
+        if n == plr.Name or n == plr.DisplayName then return true end
+    end
+    return false
+end
+
+local function getClosestTarget()
+    local myChar = LocalPlayer.Character
+    if not myChar then return nil end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+
+    local myPos = myRoot.Position
+    local myTeam = LocalPlayer.Team
+    local closest, closestDist = nil, math.huge
+    local radius = Config.TrackRadius
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        if myTeam and plr.Team == myTeam then continue end
+
+        local inList = isInList(plr)
+        if Config.ListMode == "Whitelist" then
+            if not inList then continue end
+        else
+            if inList then continue end
+        end
+
+        local char = plr.Character
+        if not char then continue end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then continue end
+
+        local dist = (root.Position - myPos).Magnitude
+        if dist > radius then continue end
+
+        if dist < closestDist then
+            closest = char
+            closestDist = dist
+        end
+    end
+    return closest
+end
+
+RunService.RenderStepped:Connect(function()
+    if Config.AutoTrack then
+        currentTarget = getClosestTarget()
+    else
+        currentTarget = nil
+    end
+end)
+
+-- ============ Raycast Hook（强制命中 + 穿墙） ============
+local originalRaycast = Workspace.Raycast
+
+local function newRaycast(self, origin, direction, userParams)
+    -- 如果没开追踪且没开穿墙，老老实实走原版
+    if not Config.WallBang and not (Config.AutoTrack and currentTarget) then
+        return originalRaycast(self, origin, direction, userParams)
+    end
+
+    local params = userParams or RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = params.FilterDescendantsInstances or {}
+    if LocalPlayer.Character and not table.find(filter, LocalPlayer.Character) then
+        table.insert(filter, LocalPlayer.Character)
+    end
+    params.FilterDescendantsInstances = filter
+
+    -- 核心强制命中逻辑：只要追踪开着且有敌人，无视你朝哪里开枪
+    local actualDir = direction
+    if Config.AutoTrack and currentTarget then
+        local aimPart = currentTarget:FindFirstChild(Config.AimPart)
+        if not aimPart then aimPart = currentTarget:FindFirstChild("HumanoidRootPart") end
+        if aimPart then
+            -- 强制把方向掰向敌人，完全无视原本的 direction
+            actualDir = aimPart.Position - origin
+        end
+    end
+
+    -- 如果没开穿墙，直接按新方向发射一次
+    if not Config.WallBang then
+        return originalRaycast(self, origin, actualDir, params)
+    end
+
+    -- 如果开了穿墙，就循环穿透障碍物，直到打到人
+    local maxDist = actualDir.Magnitude
+    if maxDist < 0.01 then return nil end
+    local dirUnit = actualDir.Unit
+    local curOrigin = origin
+    local traveled = 0
+
+    while traveled < maxDist do
+        local remain = maxDist - traveled
+        local result = originalRaycast(self, curOrigin, dirUnit * remain, params)
+        if not result then
+            break
+        end
+        local hitInst = result.Instance
+        local model = hitInst:FindFirstAncestorOfClass("Model")
+        local hum = model and model:FindFirstChildOfClass("Humanoid")
+        if hum then
+            return result
+        end
+        table.insert(params.FilterDescendantsInstances, hitInst)
+        traveled = traveled + (result.Position - curOrigin).Magnitude
+        curOrigin = result.Position + dirUnit * 0.1
+    end
+    return nil
+end
+
+if hookfunction then
+    hookfunction(Workspace.Raycast, newRaycast)
+else
+    Workspace.Raycast = newRaycast
+end
+
+-- ====================================================
+-- ============== UI 部分（移动端全面重写） ============
+-- ====================================================
+
+if game.CoreGui:FindFirstChild("TrackerUI") then
+    game.CoreGui.TrackerUI:Destroy()
+end
+
+local parentGui = (gethui and gethui()) or game.CoreGui
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "TrackerUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = parentGui
+
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = Config.UIScale
+uiScale.Parent = gui
+
+-- ========== 悬浮球 ==========
+local ball = Instance.new("TextButton")
+ball.Size = UDim2.new(0, 60, 0, 60)
+ball.Position = UDim2.new(0, 50, 0, 250)
+ball.BackgroundColor3 = Color3.fromRGB(15, 20, 30)
+ball.Text = ""
+ball.AutoButtonColor = false
+ball.BorderSizePixel = 0
+ball.Parent = gui
+Instance.new("UICorner", ball).CornerRadius = UDim.new(1, 0)
+
+local ballStroke = Instance.new("UIStroke")
+ballStroke.Thickness = 2
+ballStroke.Transparency = 0.15
+ballStroke.Parent = ball
+
+local ballGrad = Instance.new("UIGradient")
+ballGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 200, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(160, 0, 255)),
+})
+ballGrad.Parent = ballStroke
+
+local ballIcon = Instance.new("TextLabel")
+ballIcon.Size = UDim2.new(1, 0, 1, 0)
+ballIcon.BackgroundTransparency = 1
+ballIcon.Text = "◎"
+ballIcon.TextColor3 = Color3.fromRGB(0, 220, 255)
+ballIcon.Font = Enum.Font.GothamBold
+ballIcon.TextSize = 30
+ballIcon.Parent = ball
+
+-- ========== 主面板 ==========
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0, 250, 0, 440)
+panel.Position = UDim2.new(0, 150, 0, 150)
+panel.BackgroundColor3 = Color3.fromRGB(15, 18, 28)
+panel.BackgroundTransparency = 0.08
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Thickness = 1.5
+panelStroke.Transparency = 0.4
+panelStroke.Parent = panel
+
+local psGrad = Instance.new("UIGradient")
+psGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 200, 255)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(160, 0, 255)),
+})
+psGrad.Parent = panelStroke
+
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1,0,0,35)
+topBar.BackgroundTransparency = 1
+topBar.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.new(0, 14, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "TRACKER v3"
+title.TextColor3 = Color3.fromRGB(0, 220, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = topBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0,28,0,28)
+closeBtn.Position = UDim2.new(1, -34,0.5,-14)
+closeBtn.BackgroundColor3 = Color3.fromRGB(160,40,40)
+closeBtn.Text = "×"
+closeBtn.TextColor3 = Color3.new(1,1,1)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize =16
+closeBtn.AutoButtonColor = false
+closeBtn.BorderSizePixel =0
+closeBtn.Parent = topBar
+Instance.new("UICorner",closeBtn).CornerRadius = UDim.new(0,6)
+
+-- 总开关
+local masterRow = Instance.new("TextButton")
+masterRow.Size = UDim2.new(1, -20, 0, 50)
+masterRow.Position = UDim2.new(0, 10, 0, 40)
+masterRow.BackgroundColor3 = Color3.fromRGB(22, 26, 38)
+masterRow.Text = ""
+masterRow.AutoButtonColor = false
+masterRow.BorderSizePixel = 0
+masterRow.Parent = panel
+Instance.new("UICorner", masterRow).CornerRadius = UDim.new(0, 10)
+
+local mrLabel = Instance.new("TextLabel")
+mrLabel.Size = UDim2.new(1, -60,1,0)
+mrLabel.Position = UDim2.new(0,12,0,0)
+mrLabel.BackgroundTransparency =1
+mrLabel.Text = "自动追踪"
+mrLabel.TextColor3 = Color3.fromRGB(220,230,255)
+mrLabel.Font = Enum.Font.GothamBold
+mrLabel.TextSize =13
+mrLabel.TextXAlignment = Enum.TextXAlignment.Left
+mrLabel.Parent = masterRow
+
+local swTrack = Instance.new("Frame")
+swTrack.Size = UDim2.new(0, 42, 0, 22)
+swTrack.Position = UDim2.new(1, -54, 0.5, -11)
+swTrack.BackgroundColor3 = Color3.fromRGB(60, 70, 90)
+swTrack.BorderSizePixel =0
+swTrack.Parent = masterRow
+Instance.new("UICorner", swTrack).CornerRadius = UDim.new(1, 0)
+
+local swKnob = Instance.new("Frame")
+swKnob.Size = UDim2.new(0, 18, 0, 18)
+swKnob.Position = UDim2.new(0, 2, 0.5, -9)
+swKnob.BackgroundColor3 = Color3.new(1,1,1)
+swKnob.BorderSizePixel =0
+swKnob.Parent = swTrack
+Instance.new("UICorner", swKnob).CornerRadius = UDim.new(1, 0)
+
+local function updateSwitch(anim)
+    local on = Config.AutoTrack
+    local info = anim and TweenInfo.new(0.2) or TweenInfo.new(0)
+    TweenService:Create(swTrack, info, {BackgroundColor3 = on and Color3.fromRGB(0, 180, 110) or Color3.fromRGB(60, 70, 90)}):Play()
+    TweenService:Create(swKnob, info, {Position = on and UDim2.new(1, -20, 0.5, -9) or UDim2.new(0, 2, 0.5, -9)}):Play()
+end
+updateSwitch(false)
+
+-- 瞄准部位
+local aimRow = Instance.new("Frame")
+aimRow.Size = UDim2.new(1,-20,0,36)
+aimRow.Position = UDim2.new(0,10,0,98)
+aimRow.BackgroundColor3 = Color3.fromRGB(22,26,38)
+aimRow.BorderSizePixel =0
+aimRow.Parent = panel
+Instance.new("UICorner",aimRow).CornerRadius = UDim.new(0,10)
+
+local aimLabel = Instance.new("TextLabel")
+aimLabel.Size = UDim2.new(0,80,1,0)
+aimLabel.Position = UDim2.new(0,12,0,0)
+aimLabel.BackgroundTransparency =1
+aimLabel.Text = "瞄准部位"
+aimLabel.TextColor3 = Color3.fromRGB(220,230,255)
+aimLabel.Font = Enum.Font.GothamBold
+aimLabel.TextSize =12
+aimLabel.TextXAlignment = Enum.TextXAlignment.Left
+aimLabel.Parent = aimRow
+
+local headBtn = Instance.new("TextButton")
+headBtn.Size = UDim2.new(0,54,0,24)
+headBtn.Position = UDim2.new(1,-120,0.5,-12)
+headBtn.BackgroundColor3 = Color3.fromRGB(40,60,90)
+headBtn.Text = "头部"
+headBtn.TextColor3 = Color3.new(1,1,1)
+headBtn.Font = Enum.Font.GothamBold
+headBtn.TextSize =11
+headBtn.AutoButtonColor = false
+headBtn.BorderSizePixel =0
+headBtn.Parent = aimRow
+Instance.new("UICorner",headBtn).CornerRadius = UDim.new(0,5)
+
+local bodyBtn = Instance.new("TextButton")
+bodyBtn.Size = UDim2.new(0,54,0,24)
+bodyBtn.Position = UDim2.new(1,-62,0.5,-12)
+bodyBtn.BackgroundColor3 = Color3.fromRGB(32,38,52)
+bodyBtn.Text = "身体"
+bodyBtn.TextColor3 = Color3.new(0.85,0.85,0.85)
+bodyBtn.Font = Enum.Font.GothamBold
+bodyBtn.TextSize =11
+bodyBtn.AutoButtonColor = false
+bodyBtn.BorderSizePixel =0
+bodyBtn.Parent = aimRow
+Instance.new("UICorner",bodyBtn).CornerRadius = UDim.new(0,5)
+
+local function updateAimUI()
+    local isHead = Config.AimPart == "Head"
+    TweenService:Create(headBtn, TweenInfo.new(0.15), {BackgroundColor3 = isHead and Color3.fromRGB(0, 160, 210) or Color3.fromRGB(32,38,52),TextColor3=isHead and Color3.new(1,1,1) or Color3.new(0.7,0.7,0.7)}):Play()
+    TweenService:Create(bodyBtn, TweenInfo.new(0.15), {BackgroundColor3 = (not isHead) and Color3.fromRGB(0, 160, 210) or Color3.fromRGB(32,38,52),TextColor3=(not isHead) and Color3.new(1,1,1) or Color3.new(0.7,0.7,0.7)}):Play()
+end
+updateAimUI()
+
+-- 追踪半径
+local radiusRow = Instance.new("Frame")
+radiusRow.Size = UDim2.new(1,-20,0,50)
+radiusRow.Position = UDim2.new(0,10,0,142)
+radiusRow.BackgroundColor3 = Color3.fromRGB(22,26,38)
+radiusRow.BorderSizePixel =0
+radiusRow.Parent = panel
+Instance.new("UICorner",radiusRow).CornerRadius = UDim.new(0,10)
+
+local radiusValue = Instance.new("TextLabel")
+radiusValue.Size = UDim2.new(1,-20,0,18)
+radiusValue.Position = UDim2.new(0,10,0,4)
+radiusValue.BackgroundTransparency =1
+radiusValue.Text = "追踪半径: " .. Config.TrackRadius .. " 格"
+radiusValue.TextColor3 = Color3.fromRGB(0, 220, 255)
+radiusValue.Font = Enum.Font.GothamBold
+radiusValue.TextSize = 11
+radiusValue.TextXAlignment = Enum.TextXAlignment.Left
+radiusValue.Parent = radiusRow
+
+local R_MIN, R_MAX = 50, 1000
+local R_RANGE = R_MAX - R_MIN
+local trackBg = Instance.new("Frame")
+trackBg.Size = UDim2.new(1,-20,0,6)
+trackBg.Position = UDim2.new(0,10,1,-12)
+trackBg.BackgroundColor3 = Color3.fromRGB(45,52,70)
+trackBg.BorderSizePixel =0
+trackBg.Parent = radiusRow
+Instance.new("UICorner", trackBg).CornerRadius = UDim.new(1, 0)
+
+local fill = Instance.new("Frame")
+fill.Size = UDim2.new((Config.TrackRadius - R_MIN)/R_RANGE, 0, 1, 0)
+fill.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+fill.BorderSizePixel =0
+fill.Parent = trackBg
+Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.new(0, 12, 0, 12)
+knob.Position = UDim2.new((Config.TrackRadius - R_MIN)/R_RANGE, -6, 0.5, -6)
+knob.BackgroundColor3 = Color3.new(1,1,1)
+knob.BorderSizePixel =0
+knob.ZIndex = 2
+knob.Parent = trackBg
+Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+-- UI缩放
+local scaleRow = Instance.new("Frame")
+scaleRow.Size = UDim2.new(1,-20,0,50)
+scaleRow.Position = UDim2.new(0,10,0,196)
+scaleRow.BackgroundColor3 = Color3.fromRGB(22,26,38)
+scaleRow.BorderSizePixel =0
+scaleRow.Parent = panel
+Instance.new("UICorner",scaleRow).CornerRadius = UDim.new(0,10)
+
+local scaleValue = Instance.new("TextLabel")
+scaleValue.Size = UDim2.new(1,-20,0,18)
+scaleValue.Position = UDim2.new(0,10,0,4)
+scaleValue.BackgroundTransparency =1
+scaleValue.Text = "界面缩放: "..math.floor(Config.UIScale*100).."%"
+scaleValue.TextColor3 = Color3.fromRGB(0, 220, 255)
+scaleValue.Font = Enum.Font.GothamBold
+scaleValue.TextSize = 11
+scaleValue.TextXAlignment = Enum.TextXAlignment.Left
+scaleValue.Parent = scaleRow
+
+local S_MIN, S_MAX = 0.5,2.0
+local S_RANGE = S_MAX - S_MIN
+local sTrackBg = Instance.new("Frame")
+sTrackBg.Size = UDim2.new(1,-20,0,6)
+sTrackBg.Position = UDim2.new(0,10,1,-12)
+sTrackBg.BackgroundColor3 = Color3.fromRGB(45,52,70)
+sTrackBg.BorderSizePixel =0
+sTrackBg.Parent = scaleRow
+Instance.new("UICorner", sTrackBg).CornerRadius = UDim.new(1, 0)
+
+local sFill = Instance.new("Frame")
+sFill.Size = UDim2.new((Config.UIScale - S_MIN)/S_RANGE,0,1,0)
+sFill.BackgroundColor3 = Color3.fromRGB(0, 200, 255)
+sFill.BorderSizePixel =0
+sFill.Parent = sTrackBg
+Instance.new("UICorner", sFill).CornerRadius = UDim.new(1,0)
+
+local sKnob = Instance.new("Frame")
+sKnob.Size = UDim2.new(0,12,0,12)
+sKnob.Position = UDim2.new((Config.UIScale - S_MIN)/S_RANGE, -6,0.5,-6)
+sKnob.BackgroundColor3 = Color3.new(1,1,1)
+sKnob.BorderSizePixel =0
+sKnob.ZIndex =2
+sKnob.Parent = sTrackBg
+Instance.new("UICorner", sKnob).CornerRadius = UDim.new(1,0)
+
+-- 名单模式
+local modeRow = Instance.new("Frame")
+modeRow.Size = UDim2.new(1,-20,0,32)
+modeRow.Position = UDim2.new(0,10,0,250)
+modeRow.BackgroundColor3 = Color3.fromRGB(22,26,38)
+modeRow.BorderSizePixel =0
+modeRow.Parent = panel
+Instance.new("UICorner",modeRow).CornerRadius = UDim.new(0,8)
+
+local modeLabel = Instance.new("TextLabel")
+modeLabel.Size = UDim2.new(0,80,1,0)
+modeLabel.Position = UDim2.new(0,10,0,0)
+modeLabel.BackgroundTransparency =1
+modeLabel.Text = "名单模式"
+modeLabel.TextColor3 = Color3.fromRGB(220,230,255)
+modeLabel.Font = Enum.Font.GothamBold
+modeLabel.TextSize =11
+modeLabel.TextXAlignment = Enum.TextXAlignment.Left
+modeLabel.Parent = modeRow
+
+local wlBtn = Instance.new("TextButton")
+wlBtn.Size = UDim2.new(0,52,0,22)
+wlBtn.Position = UDim2.new(1,-116,0.5,-11)
+wlBtn.BackgroundColor3 = Color3.fromRGB(32,38,52)
+wlBtn.Text = "白名单"
+wlBtn.TextColor3 = Color3.new(0.8,0.8,0.8)
+wlBtn.Font = Enum.Font.GothamBold
+wlBtn.TextSize =10
+wlBtn.AutoButtonColor = false
+wlBtn.BorderSizePixel =0
+wlBtn.Parent = modeRow
+Instance.new("UICorner",wlBtn).CornerRadius = UDim.new(0,4)
+
+local blBtn = Instance.new("TextButton")
+blBtn.Size = UDim2.new(0,52,0,22)
+blBtn.Position = UDim2.new(1,-58,0.5,-11)
+blBtn.BackgroundColor3 = Color3.fromRGB(0,140,180)
+blBtn.Text = "黑名单"
+blBtn.TextColor3 = Color3.new(1,1,1)
+blBtn.Font = Enum.Font.GothamBold
+blBtn.TextSize =10
+blBtn.AutoButtonColor = false
+blBtn.BorderSizePixel =0
+blBtn.Parent = modeRow
+Instance.new("UICorner",blBtn).CornerRadius = UDim.new(0,4)
+
+local function updateModeUI()
+    local isBl = Config.ListMode == "Blacklist"
+    TweenService:Create(blBtn,TweenInfo.new(0.15),{BackgroundColor3=isBl and Color3.fromRGB(0,140,180) or Color3.fromRGB(32,38,52),TextColor3=isBl and Color3.new(1,1,1) or Color3.new(0.7,0.7,0.7)}):Play()
+    TweenService:Create(wlBtn,TweenInfo.new(0.15),{BackgroundColor3=(not isBl) and Color3.fromRGB(0,140,180) or Color3.fromRGB(32,38,52),TextColor3=(not isBl) and Color3.new(1,1,1) or Color3.new(0.7,0.7,0.7)}):Play()
+end
+updateModeUI()
+
+-- 输入框
+local inputRow = Instance.new("Frame")
+inputRow.Size = UDim2.new(1,-20,0,30)
+inputRow.Position = UDim2.new(0,10,0,286)
+inputRow.BackgroundTransparency =1
+inputRow.Parent = panel
+
+local playerInput = Instance.new("TextBox")
+playerInput.Size = UDim2.new(1,-70,1,0)
+playerInput.BackgroundColor3 = Color3.fromRGB(22,26,38)
+playerInput.BorderSizePixel =0
+playerInput.PlaceholderText = "输入玩家名字"
+playerInput.Text = ""
+playerInput.TextColor3 = Color3.new(1,1,1)
+playerInput.PlaceholderColor3 = Color3.fromRGB(110,125,150)
+playerInput.Font = Enum.Font.GothamMedium
+playerInput.TextSize =11
+playerInput.TextXAlignment = Enum.TextXAlignment.Left
+playerInput.Parent = inputRow
+Instance.new("UICorner",playerInput).CornerRadius = UDim.new(0,6)
+
+local addBtn = Instance.new("TextButton")
+addBtn.Size = UDim2.new(0,60,1,0)
+addBtn.Position = UDim2.new(1,-60,0,0)
+addBtn.BackgroundColor3 = Color3.fromRGB(0,140,180)
+addBtn.Text = "+ 添加"
+addBtn.TextColor3 = Color3.new(1,1,1)
+addBtn.Font = Enum.Font.GothamBold
+addBtn.TextSize =11
+addBtn.AutoButtonColor = false
+addBtn.BorderSizePixel =0
+addBtn.Parent = inputRow
+Instance.new("UICorner",addBtn).CornerRadius = UDim.new(0,6)
+
+-- 名单滚动列表
+local listScroll = Instance.new("ScrollingFrame")
+listScroll.Size = UDim2.new(1,-20,0,90)
+listScroll.Position = UDim2.new(0,10,0,322)
+listScroll.BackgroundColor3 = Color3.fromRGB(18,22,32)
+listScroll.BorderSizePixel =0
+listScroll.ScrollBarThickness =4
+listScroll.CanvasSize = UDim2.new(0,0,0,0)
+listScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listScroll.Parent = panel
+Instance.new("UICorner",listScroll).CornerRadius = UDim.new(0,8)
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0,3)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = listScroll
+
+local function rebuildList()
+    for _,c in ipairs(listScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    for idx,name in ipairs(Config.PlayerList) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1,-8,0,24)
+        row.BackgroundColor3 = Color3.fromRGB(28,33,46)
+        row.LayoutOrder = idx
+        row.Parent = listScroll
+        Instance.new("UICorner",row).CornerRadius = UDim.new(0,4)
+
+        local namelbl = Instance.new("TextLabel")
+        namelbl.Size = UDim2.new(1,-28,1,0)
+        namelbl.Position = UDim2.new(0,8,0,0)
+        namelbl.BackgroundTransparency =1
+        namelbl.Text = name
+        namelbl.TextColor3 = Color3.fromRGB(210,220,240)
+        namelbl.Font = Enum.Font.GothamMedium
+        namelbl.TextSize =11
+        namelbl.TextXAlignment = Enum.TextXAlignment.Left
+        namelbl.Parent = row
+
+        local delBtn = Instance.new("TextButton")
+        delBtn.Size = UDim2.new(0,20,0,20)
+        delBtn.Position = UDim2.new(1,-24,0.5,-10)
+        delBtn.BackgroundColor3 = Color3.fromRGB(170,45,45)
+        delBtn.Text = "−"
+        delBtn.TextColor3 = Color3.new(1,1,1)
+        delBtn.Font = Enum.Font.GothamBold
+        delBtn.TextSize =12
+        delBtn.AutoButtonColor = false
+        delBtn.BorderSizePixel =0
+        delBtn.Parent = row
+        Instance.new("UICorner",delBtn).CornerRadius = UDim.new(1,0)
+
+        delBtn.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                local i = table.find(Config.PlayerList,name)
+                if i then table.remove(Config.PlayerList,i) end
+                rebuildList()
+            end
+        end)
+    end
+end
+
+local function addPlayer()
+    local name = playerInput.Text
+    if name == "" then return end
+    if table.find(Config.PlayerList,name) then playerInput.Text="" return end
+    table.insert(Config.PlayerList,name)
+    playerInput.Text = ""
+    rebuildList()
+end
+
+addBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then addPlayer() end
+end)
+playerInput.FocusLost:Connect(function(enter) if enter then addPlayer() end end)
+rebuildList()
+
+-- ========== 密码弹窗 ==========
+local passOverlay = Instance.new("Frame")
+passOverlay.Size = UDim2.new(1, 0, 1, 0)
+passOverlay.BackgroundColor3 = Color3.new(0,0,0)
+passOverlay.BackgroundTransparency = 0.6
+passOverlay.BorderSizePixel = 0
+passOverlay.Visible = false
+passOverlay.ZIndex = 20
+passOverlay.Parent = gui
+
+local passBox = Instance.new("Frame")
+passBox.Size = UDim2.new(0, 240, 0, 150)
+passBox.Position = UDim2.new(0.5, -120, 0.5, -75)
+passBox.BackgroundColor3 = Color3.fromRGB(15,18,28)
+passBox.BorderSizePixel =0
+passBox.ZIndex =21
+passBox.Parent = passOverlay
+Instance.new("UICorner",passBox).CornerRadius = UDim.new(0,10)
+
+local pt = Instance.new("TextLabel")
+pt.Size = UDim2.new(1,-20,0,26)
+pt.Position = UDim2.new(0,10,0,8)
+pt.BackgroundTransparency =1
+pt.Text = "◆ 需要密码开启追踪"
+pt.TextColor3 = Color3.fromRGB(0,210,240)
+pt.Font = Enum.Font.GothamBold
+pt.TextSize =13
+pt.TextXAlignment = Enum.TextXAlignment.Left
+pt.ZIndex=22
+pt.Parent = passBox
+
+local pbInput = Instance.new("TextBox")
+pbInput.Size = UDim2.new(1,-24,0,36)
+pbInput.Position = UDim2.new(0,12,0,40)
+pbInput.BackgroundColor3 = Color3.fromRGB(24,29,42)
+pbInput.BorderSizePixel =0
+pbInput.Text = ""
+pbInput.PlaceholderText = "输入密码"
+pbInput.TextColor3 = Color3.new(1,1,1)
+pbInput.Font = Enum.Font.GothamMedium
+pbInput.TextSize =12
+pbInput.ZIndex=22
+pbInput.Parent = passBox
+Instance.new("UICorner",pbInput).CornerRadius = UDim.new(0,7)
+
+local pbErr = Instance.new("TextLabel")
+pbErr.Size = UDim2.new(1,-20,0,18)
+pbErr.Position = UDim2.new(0,12,0,82)
+pbErr.BackgroundTransparency =1
+pbErr.Text = ""
+pbErr.TextColor3 = Color3.fromRGB(255,85,85)
+pbErr.Font = Enum.Font.GothamMedium
+pbErr.TextSize =11
+pbErr.TextXAlignment = Enum.TextXAlignment.Left
+pbErr.ZIndex=22
+pbErr.Parent = passBox
+
+local pbOk = Instance.new("TextButton")
+pbOk.Size = UDim2.new(0,100,0,32)
+pbOk.Position = UDim2.new(0,12,1,-44)
+pbOk.BackgroundColor3 = Color3.fromRGB(0,150,110)
+pbOk.Text = "确认"
+pbOk.TextColor3 = Color3.new(1,1,1)
+pbOk.Font = Enum.Font.GothamBold
+pbOk.TextSize =12
+pbOk.AutoButtonColor = false
+pbOk.BorderSizePixel =0
+pbOk.ZIndex=22
+pbOk.Parent = passBox
+Instance.new("UICorner",pbOk).CornerRadius = UDim.new(0,6)
+
+local pbCancel = Instance.new("TextButton")
+pbCancel.Size = UDim2.new(0,100,0,32)
+pbCancel.Position = UDim2.new(1,-112,1,-44)
+pbCancel.BackgroundColor3 = Color3.fromRGB(50,58,78)
+pbCancel.Text = "取消"
+pbCancel.TextColor3 = Color3.new(0.9,0.9,0.9)
+pbCancel.Font = Enum.Font.GothamBold
+pbCancel.TextSize =12
+pbCancel.AutoButtonColor = false
+pbCancel.BorderSizePixel =0
+pbCancel.ZIndex=22
+pbCancel.Parent = passBox
+Instance.new("UICorner",pbCancel).CornerRadius = UDim.new(0,6)
+
+local function openPass()
+    pbInput.Text = ""
+    pbErr.Text = ""
+    passOverlay.Visible = true
+    task.wait(0.05)
+    pbInput:CaptureFocus()
+end
+
+local function closePass()
+    passOverlay.Visible = false
+    pbInput:ReleaseFocus()
+end
+
+local function shakeFrame(frameObj)
+    local orig = frameObj.Position
+    for _,off in ipairs({6,-6,4,-4,2,-2,0}) do
+        frameObj.Position = orig + UDim2.new(0,off,0,0)
+        task.wait(0.04)
+    end
+    frameObj.Position = orig
+end
+
+local function tryUnlock()
+    if pbInput.Text == SECRET then
+        Config.AutoTrack = true
+        updateSwitch(true)
+        closePass()
+    else
+        pbErr.Text = "密码错误"
+        pbInput.Text = ""
+        shakeFrame(passBox)
+    end
+end
+
+pbOk.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then tryUnlock() end
+end)
+pbInput.FocusLost:Connect(function(enter) if enter then tryUnlock() end end)
+pbCancel.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then closePass() end
+end)
+
+-- ====================================================
+-- ============ 拖拽工具 ============
+-- ====================================================
+local function makeDraggable(frame, dragHandle)
+    local dragging, dragInput, dragStart, startPos
+    local movedDistance = 0
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            movedDistance = 0
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            movedDistance = math.sqrt(delta.X^2 + delta.Y^2)
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    return function() return movedDistance end
+end
+
+local getBallMoved = makeDraggable(ball, ball)
+
+ball.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        TweenService:Create(ball, TweenInfo.new(0.1), {Size = UDim2.new(0, 50, 0, 50)}):Play()
+    end
+end)
+
+ball.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        TweenService:Create(ball, TweenInfo.new(0.1), {Size = UDim2.new(0, 60, 0, 60)}):Play()
+        if getBallMoved() < 5 then
+            panel.Visible = true
+            panel.Size = UDim2.new(0, 0, 0, 0)
+            panel.Position = UDim2.new(0.5, -125, 0.5, -220)
+            TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(0, 250, 0, 440)}):Play()
+            ball.Visible = false
+        end
+    end
+end)
+
+local getPanelMoved = makeDraggable(panel, topBar)
+
+closeBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size = UDim2.new(0,0,0,0), Position = UDim2.new(0.5,-125,0.5,-220)}):Play()
+        task.wait(0.22)
+        panel.Visible = false
+        ball.Visible = true
+    end
+end)
+
+masterRow.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Config.AutoTrack then
+            Config.AutoTrack = false
+            updateSwitch(true)
+        else
+            openPass()
+        end
+    end
+end)
+
+headBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        Config.AimPart = "Head"
+        updateAimUI()
+    end
+end)
+
+bodyBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        Config.AimPart = "HumanoidRootPart"
+        updateAimUI()
+    end
+end)
+
+wlBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        Config.ListMode = "Whitelist"
+        updateModeUI()
+    end
+end)
+
+blBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        Config.ListMode = "Blacklist"
+        updateModeUI()
+    end
+end)
+
+local function bindSlider(trackFrame, fillFrame, knobFrame, minVal, maxVal, callback)
+    local draggingSlider = false
+    local function updateSlider(inputX)
+        local absPos = trackFrame.AbsolutePosition.X
+        local absSize = trackFrame.AbsoluteSize.X
+        local rel = math.clamp((inputX - absPos)/absSize, 0,1)
+        local val = minVal + rel*(maxVal-minVal)
+        callback(val, rel)
+    end
+    trackFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingSlider = true
+            updateSlider(input.Position.X)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateSlider(input.Position.X)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            draggingSlider = false
+        end
+    end)
+end
+
+bindSlider(trackBg, fill, knob, R_MIN, R_MAX, function(val, relX)
+    val = math.floor(val / 10 + 0.5) * 10
+    Config.TrackRadius = val
+    radiusValue.Text = "追踪半径: "..val.." 格"
+    fill.Size = UDim2.new(relX,0,1,0)
+    knob.Position = UDim2.new(relX, -6, 0.5, -6)
+end)
+
+bindSlider(sTrackBg, sFill, sKnob, S_MIN, S_MAX, function(val, relX)
+    Config.UIScale = math.floor(val*10+0.5)/10
+    scaleValue.Text = "界面缩放: "..math.floor(Config.UIScale*100).."%"
+    sFill.Size = UDim2.new(relX,0,1,0)
+    sKnob.Position = UDim2.new(relX, -6, 0.5, -6)
+    uiScale.Scale = Config.UIScale
+end)
+
+print("[Neon Tracker v3 - Force Hit] 已加载 | 强制伤害反馈 | 移动端适配")
